@@ -127,13 +127,23 @@ def fetch_fpl_injuries() -> dict[str, list[dict]]:
         except (ValueError, TypeError):
             ownership = 0.0
 
+        try:
+            minutes = int(p.get("minutes") or 0)
+            total_pts = int(p.get("total_points") or 0)
+            ppg = float(p.get("points_per_game") or 0)
+        except (ValueError, TypeError):
+            minutes, total_pts, ppg = 0, 0, 0.0
+
         result.setdefault(db_name, []).append({
-            "name":      p["web_name"],
-            "status":    p["status"],
-            "label":     STATUS_LABEL.get(p["status"], p["status"]),
-            "chance":    chance,          # 0-100 or None
-            "news":      p.get("news", ""),
-            "ownership": ownership,       # % of FPL managers who own them
+            "name":       p["web_name"],
+            "status":     p["status"],
+            "label":      STATUS_LABEL.get(p["status"], p["status"]),
+            "chance":     chance,
+            "news":       p.get("news", ""),
+            "ownership":  ownership,
+            "minutes":    minutes,    # season minutes played — best proxy for starter
+            "total_pts":  total_pts,  # season FPL points
+            "ppg":        ppg,        # points per game
         })
 
     return result
@@ -143,13 +153,34 @@ def fetch_fpl_injuries() -> dict[str, list[dict]]:
 PLAYER_WEIGHT = {"Key player": 1.0, "Normal": 0.4, "Irrelevant": 0.0}
 
 
-def default_classification(player: dict) -> str:
-    """Derive a starting classification from FPL ownership %."""
-    if player["ownership"] >= 25:
+def auto_classify_player(player: dict) -> str:
+    """
+    Classify an injured player's importance using objective FPL season stats.
+
+    Logic (in priority order):
+      - minutes > 900  AND total_pts > 70  → Key player  (undisputed starter)
+      - ppg >= 5.5     OR  total_pts > 55  → Key player  (high-impact player)
+      - minutes > 300  AND total_pts > 25  → Normal      (squad regular)
+      - otherwise                          → Irrelevant  (fringe / backup)
+
+    This means a goalkeeper with 1800 min / 80 pts is Key, a bench striker
+    with 120 min / 8 pts is Irrelevant — no human judgment required.
+    """
+    m  = player.get("minutes", 0) or 0
+    tp = player.get("total_pts", 0) or 0
+    pg = player.get("ppg", 0.0) or 0.0
+
+    if m > 900 and tp > 70:
         return "Key player"
-    elif player["ownership"] < 5:
-        return "Irrelevant"
-    return "Normal"
+    if pg >= 5.5 or tp > 55:
+        return "Key player"
+    if m > 300 and tp > 25:
+        return "Normal"
+    return "Irrelevant"
+
+
+# Keep old name as alias so the manual predict tab still works unchanged
+default_classification = auto_classify_player
 
 
 def injury_team_factor(players: list[dict], overrides: dict[str, str]) -> float:
@@ -174,8 +205,65 @@ def apply_injury_factor(feats: dict, prefix: str, factor: float) -> dict:
     feats = dict(feats)
     feats[f"{prefix}Form"]       *= factor
     feats[f"{prefix}GoalsAvg"]   *= factor
-    feats[f"{prefix}ConcedeAvg"] /= factor   # worse defence when weakened
+    feats[f"{prefix}ConcedeAvg"] /= factor
     return feats
+
+
+def predict_fixture(home: str, away: str, df: pd.DataFrame,
+                    model, le, all_injuries: dict) -> dict | None:
+    """
+    Run a full prediction for one fixture, auto-classifying injuries.
+    Returns a result dict or None if teams not in DB.
+    """
+    home_mask = df["HomeTeam"] == home
+    away_mask = df["AwayTeam"] == away
+    if not home_mask.any() or not away_mask.any():
+        return None
+
+    def latest(team, home_side):
+        prefix = "Home" if home_side else "Away"
+        mask   = (df["HomeTeam"] == team) if home_side else (df["AwayTeam"] == team)
+        row    = df[mask].sort_values("Date").iloc[-1]
+        return {
+            f"{prefix}Form":       row[f"{prefix}Form"],
+            f"{prefix}GoalsAvg":   row[f"{prefix}GoalsAvg"],
+            f"{prefix}ConcedeAvg": row[f"{prefix}ConcedeAvg"],
+        }
+
+    home_feats = latest(home, True)
+    away_feats = latest(away, False)
+    h2h        = h2h_stats(df, home, away)
+
+    home_players = all_injuries.get(home, [])
+    away_players = all_injuries.get(away, [])
+
+    # Fully automatic — no overrides, uses auto_classify_player for all
+    h_factor = injury_team_factor(home_players, {})
+    a_factor = injury_team_factor(away_players, {})
+
+    if h_factor < 1.0:
+        home_feats = apply_injury_factor(home_feats, "Home", h_factor)
+    if a_factor < 1.0:
+        away_feats = apply_injury_factor(away_feats, "Away", a_factor)
+
+    X     = pd.DataFrame([{**home_feats, **away_feats, **h2h}])[FEATURES]
+    proba = model.predict_proba(X)[0]
+    pdict = dict(zip(le.classes_, proba))
+    pred  = le.inverse_transform([proba.argmax()])[0]
+
+    return {
+        "home": home, "away": away,
+        "pred": pred,
+        "prob_H": pdict.get("H", 0),
+        "prob_D": pdict.get("D", 0),
+        "prob_A": pdict.get("A", 0),
+        "h_factor": h_factor,
+        "a_factor": a_factor,
+        "home_key_injured": [p["name"] for p in home_players
+                             if auto_classify_player(p) == "Key player"],
+        "away_key_injured": [p["name"] for p in away_players
+                             if auto_classify_player(p) == "Key player"],
+    }
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
 
@@ -710,33 +798,129 @@ with tab3:
         fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#f0f0f0")
         st.plotly_chart(fig_pie, use_container_width=True)
 
-# ── Tab 4 : Fixtures ─────────────────────────────────────────────────────────
+# ── Tab 4 : Fixtures & GW Predictions ────────────────────────────────────────
 with tab4:
-    st.subheader("Upcoming fixtures")
-    if st.button("Refresh fixtures"):
-        fetch_upcoming_fixtures.clear()
-        st.rerun()
+    st.subheader("Upcoming fixtures & predictions")
+
+    col_r1, col_r2 = st.columns([1, 1])
+    with col_r1:
+        if st.button("Refresh fixtures"):
+            fetch_upcoming_fixtures.clear()
+            st.rerun()
 
     fixtures = fetch_upcoming_fixtures()
     if not fixtures:
         st.warning("Could not fetch fixtures. Check your internet connection.")
     else:
-        # Group by gameweek
-        gws = sorted({f["gw"] for f in fixtures})
-        for gw in gws[:5]:  # show next 5 gameweeks
-            gw_fixtures = [f for f in fixtures if f["gw"] == gw]
-            st.markdown(f"**Gameweek {gw}**")
-            rows = []
-            for f in gw_fixtures:
-                diff_bar = lambda d: "🟢" if d <= 2 else ("🟡" if d == 3 else ("🟠" if d == 4 else "🔴"))
-                rows.append({
-                    "Kick-off":  f["kickoff"],
-                    "Home":      f["home"],
-                    "Away":      f["away"],
-                    "Home diff": diff_bar(f["home_diff"]),
-                    "Away diff": diff_bar(f["away_diff"]),
+        gws  = sorted({f["gw"] for f in fixtures})
+        # Selector: which GW to predict
+        sel_gw = st.selectbox("Gameweek", gws, index=0)
+        gw_fix = [f for f in fixtures if f["gw"] == sel_gw]
+
+        diff_icon = lambda d: "🟢" if d <= 2 else ("🟡" if d == 3 else ("🟠" if d == 4 else "🔴"))
+
+        # ── Auto-predict all fixtures in selected GW
+        try:
+            model_gw, le_gw = load_model()
+            results = []
+            for f in gw_fix:
+                res = predict_fixture(f["home"], f["away"], df,
+                                      model_gw, le_gw, all_injuries)
+                if res is None:
+                    continue
+
+                pred_label = {"H": f["home"], "D": "Draw", "A": f["away"]}[res["pred"]]
+                conf = max(res["prob_H"], res["prob_D"], res["prob_A"])
+
+                inj_notes = []
+                if res["home_key_injured"]:
+                    inj_notes.append(f"🔴 {f['home']}: {', '.join(res['home_key_injured'])}")
+                if res["away_key_injured"]:
+                    inj_notes.append(f"🔴 {f['away']}: {', '.join(res['away_key_injured'])}")
+
+                results.append({
+                    "Kick-off":    f["kickoff"],
+                    "Home":        f["home"],
+                    "Away":        f["away"],
+                    "Prediction":  pred_label,
+                    "H %":         f"{res['prob_H']*100:.0f}",
+                    "D %":         f"{res['prob_D']*100:.0f}",
+                    "A %":         f"{res['prob_A']*100:.0f}",
+                    "Confidence":  f"{conf*100:.0f}%",
+                    "Home diff":   diff_icon(f["home_diff"]),
+                    "Away diff":   diff_icon(f["away_diff"]),
+                    "Key injuries": " | ".join(inj_notes) if inj_notes else "—",
+                    # internal fields used for logging
+                    "_pred_raw":   res["pred"],
+                    "_prob_H":     res["prob_H"],
+                    "_prob_D":     res["prob_D"],
+                    "_prob_A":     res["prob_A"],
+                    "_h_factor":   res["h_factor"],
+                    "_a_factor":   res["a_factor"],
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            if results:
+                # Save to prediction log (skip duplicates by home+away+date)
+                log_existing = {(e["home"], e["away"], e["ts"][:10]) for e in load_prediction_log()}
+                today = datetime.now().strftime("%Y-%m-%d")
+                for r in results:
+                    key = (r["Home"], r["Away"], today)
+                    if key not in log_existing:
+                        save_prediction({
+                            "ts":       datetime.now().isoformat(timespec="seconds"),
+                            "home":     r["Home"],
+                            "away":     r["Away"],
+                            "pred":     r["_pred_raw"],
+                            "prob_H":   round(r["_prob_H"], 3),
+                            "prob_D":   round(r["_prob_D"], 3),
+                            "prob_A":   round(r["_prob_A"], 3),
+                            "inj_home": round(r["_h_factor"], 3),
+                            "inj_away": round(r["_a_factor"], 3),
+                            "actual":   None,
+                        })
+
+                # Display table (hide internal cols)
+                display_cols = ["Kick-off", "Home", "Away", "Prediction",
+                                "H %", "D %", "A %", "Confidence",
+                                "Home diff", "Away diff", "Key injuries"]
+                gw_df = pd.DataFrame(results)[display_cols]
+
+                def color_gw_row(row):
+                    pred = row["Prediction"]
+                    if pred == row["Home"]:
+                        c = "#1a3d4d"
+                    elif pred == "Draw":
+                        c = "#4a3d00"
+                    else:
+                        c = "#2d1a4d"
+                    return [f"background-color: {c}; color: #f0f0f0"] * len(row)
+
+                st.dataframe(
+                    gw_df.style.apply(color_gw_row, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Predictions are fully automatic. Injuries are auto-classified using "
+                    "FPL minutes played + season points (no manual input needed). "
+                    "All predictions are saved to the Prediction Log."
+                )
+
+        except FileNotFoundError:
+            st.error("Model not found — run `python model.py` first.")
+
+        # ── Other gameweeks: fixtures only
+        other_gws = [g for g in gws if g != sel_gw]
+        if other_gws:
+            with st.expander("Other upcoming gameweeks (fixtures only)"):
+                for gw in other_gws[:4]:
+                    st.markdown(f"**Gameweek {gw}**")
+                    rows = [{"Kick-off": f["kickoff"], "Home": f["home"],
+                             "Away": f["away"],
+                             "Home diff": diff_icon(f["home_diff"]),
+                             "Away diff": diff_icon(f["away_diff"])}
+                            for f in fixtures if f["gw"] == gw]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # ── Tab 5 : Prediction Log ────────────────────────────────────────────────────
 with tab5:

@@ -1,5 +1,77 @@
 [
   {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Tottenham",
+    "away": "Nott'm Forest",
+    "pred": "H",
+    "prob_H": 0.339,
+    "prob_D": 0.335,
+    "prob_A": 0.326,
+    "inj_home": 0.8,
+    "inj_away": 0.952,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Newcastle",
+    "away": "Sunderland",
+    "pred": "A",
+    "prob_H": 0.271,
+    "prob_D": 0.341,
+    "prob_A": 0.388,
+    "inj_home": 0.8,
+    "inj_away": 0.8,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Leeds",
+    "away": "Brentford",
+    "pred": "A",
+    "prob_H": 0.26,
+    "prob_D": 0.274,
+    "prob_A": 0.466,
+    "inj_home": 0.8,
+    "inj_away": 0.8,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Everton",
+    "away": "Chelsea",
+    "pred": "D",
+    "prob_H": 0.237,
+    "prob_D": 0.413,
+    "prob_A": 0.35,
+    "inj_home": 0.814,
+    "inj_away": 0.85,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Fulham",
+    "away": "Burnley",
+    "pred": "D",
+    "prob_H": 0.317,
+    "prob_D": 0.427,
+    "prob_A": 0.256,
+    "inj_home": 0.922,
+    "inj_away": 0.832,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:35:22",
+    "home": "Brighton",
+    "away": "Liverpool",
+    "pred": "A",
+    "prob_H": 0.25,
+    "prob_D": 0.228,
+    "prob_A": 0.523,
+    "inj_home": 0.988,
+    "inj_away": 0.904,
+    "actual": null
+  },
+  {
     "ts": "2026-03-18T17:29:01",
     "home": "Bournemouth",
     "away": "Man United",
