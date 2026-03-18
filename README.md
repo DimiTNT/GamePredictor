@@ -29,7 +29,7 @@ Predicts Premier League match outcomes (Home Win / Draw / Away Win) using 4 seas
 
 ```bash
 # 1. Clone & install
-git clone https://github.com/DimiTNT/football-predictor.git
+git clone
 cd football-predictor
 pip install -r requirements.txt
 
