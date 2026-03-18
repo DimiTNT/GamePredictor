@@ -27,6 +27,8 @@ FEATURES = [
     "HomeForm", "AwayForm",
     "HomeGoalsAvg", "AwayGoalsAvg",
     "HomeConcedeAvg", "AwayConcedeAvg",
+    "H2H_HomeWinRate", "H2H_AwayWinRate",
+    "H2H_HomeGoalsAvg", "H2H_AwayGoalsAvg",
 ]
 
 TARGET = "FTR"   # H / D / A
@@ -52,8 +54,20 @@ def train(df: pd.DataFrame):
     le = LabelEncoder()
     y_enc = le.fit_transform(y)   # A=0, D=1, H=2
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+    # Recent seasons carry more weight — current season matters most.
+    # We fold season recency into sample_weight. class_weight="balanced" is kept
+    # separate so that we don't double-multiply (season weight stays between 1-3).
+    SEASON_WEIGHTS = {
+        "2021-22": 1.0,
+        "2022-23": 1.2,
+        "2023-24": 1.5,
+        "2024-25": 2.0,
+        "2025-26": 3.0,  # current season has highest influence
+    }
+    season_weights = df["Season"].map(SEASON_WEIGHTS).fillna(1.0).values
+
+    X_train, X_test, y_train, y_test, w_train, _ = train_test_split(
+        X, y_enc, season_weights, test_size=0.2, random_state=42, stratify=y_enc
     )
 
     model = RandomForestClassifier(
@@ -63,13 +77,13 @@ def train(df: pd.DataFrame):
         random_state=42,
         class_weight="balanced",
     )
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=w_train)
 
     # ── Evaluation
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
 
-    print(f"\n📊 Test accuracy : {acc:.1%}")
+    print(f"\nTest accuracy: {acc:.1%}")
     print("\nClassification report:")
     print(classification_report(y_test, y_pred, target_names=le.classes_))
 
@@ -78,7 +92,7 @@ def train(df: pd.DataFrame):
     cm_df = pd.DataFrame(cm, index=le.classes_, columns=le.classes_)
     print(cm_df)
 
-    # ── Feature importance
+    # Feature importance
     fi = pd.Series(model.feature_importances_, index=FEATURES).sort_values(ascending=False)
     print("\nFeature importances:")
     print(fi.round(3))
@@ -94,7 +108,7 @@ def save(model, le):
         pickle.dump(model, f)
     with open(ENC_PATH, "wb") as f:
         pickle.dump(le, f)
-    print(f"\n✅ Model saved → {MODEL_PATH}")
+    print(f"\nModel saved -> {MODEL_PATH}")
 
 
 # ── Predict helper (used by app.py) ──────────────────────────────────────────
@@ -140,10 +154,10 @@ def predict_match(home_team: str, away_team: str, df: pd.DataFrame):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("📂 Loading data...")
+    print("Loading data...")
     df = load_data()
     print(f"   {len(df)} matches loaded")
 
-    print("🤖 Training model...")
+    print("Training model...")
     model, le = train(df)
     save(model, le)

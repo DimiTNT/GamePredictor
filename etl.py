@@ -16,11 +16,15 @@ import requests
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SEASONS = {
-    "2020-21": "https://www.football-data.co.uk/mmz4281/2021/E0.csv",
     "2021-22": "https://www.football-data.co.uk/mmz4281/2122/E0.csv",
     "2022-23": "https://www.football-data.co.uk/mmz4281/2223/E0.csv",
     "2023-24": "https://www.football-data.co.uk/mmz4281/2324/E0.csv",
+    "2024-25": "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
+    "2025-26": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",  # current season
 }
+
+CURRENT_SEASON = "2025-26"
+TIMESTAMP_PATH = "data/last_updated.txt"
 
 COLS = [
     "Date", "HomeTeam", "AwayTeam",
@@ -122,11 +126,69 @@ def add_goal_avg(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     return df
 
 
+def add_h2h(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:
+    """
+    For each match, compute head-to-head stats from the last N encounters
+    between the same two teams (any venue), BEFORE this match.
+    Features are always expressed from the current home team's perspective.
+    """
+    df = df.copy()
+    df["H2H_HomeWinRate"]  = 0.5
+    df["H2H_AwayWinRate"]  = 0.5
+    df["H2H_HomeGoalsAvg"] = 1.2
+    df["H2H_AwayGoalsAvg"] = 1.2
+
+    # history key = frozenset of the two teams; stores past match dicts
+    history: dict[frozenset, list[dict]] = {}
+
+    for idx, row in df.iterrows():
+        home, away = row["HomeTeam"], row["AwayTeam"]
+        key  = frozenset([home, away])
+        past = history.get(key, [])[-n:]
+
+        if past:
+            home_wins = away_wins = 0
+            home_goals_list: list[float] = []
+            away_goals_list: list[float] = []
+
+            for m in past:
+                # Goals from perspective of current home/away team
+                g_home = m["fthg"] if m["ht"] == home else m["ftag"]
+                g_away = m["ftag"] if m["ht"] == home else m["fthg"]
+                home_goals_list.append(g_home)
+                away_goals_list.append(g_away)
+
+                # Win from current home team's perspective
+                home_won = (m["ftr"] == "H" and m["ht"] == home) or \
+                           (m["ftr"] == "A" and m["ht"] == away)
+                away_won = (m["ftr"] == "A" and m["ht"] == home) or \
+                           (m["ftr"] == "H" and m["ht"] == away)
+                if home_won:
+                    home_wins += 1
+                elif away_won:
+                    away_wins += 1
+
+            total = len(past)
+            df.at[idx, "H2H_HomeWinRate"]  = home_wins / total
+            df.at[idx, "H2H_AwayWinRate"]  = away_wins / total
+            df.at[idx, "H2H_HomeGoalsAvg"] = sum(home_goals_list) / total
+            df.at[idx, "H2H_AwayGoalsAvg"] = sum(away_goals_list) / total
+
+        history.setdefault(key, []).append({
+            "ht": home, "fthg": row["FTHG"], "ftag": row["FTAG"], "ftr": row["FTR"],
+        })
+
+    return df
+
+
 # ── Store ─────────────────────────────────────────────────────────────────────
 
 def to_sqlite(df: pd.DataFrame, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     con = sqlite3.connect(path)
+    # Store dates as ISO strings so they load correctly (avoids int64 epoch issue)
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
     df.to_sql("matches", con, if_exists="replace", index=False)
 
     # Useful analytical views
@@ -144,32 +206,38 @@ def to_sqlite(df: pd.DataFrame, path: str) -> None:
     """)
     con.commit()
     con.close()
-    print(f"  Saved {len(df)} rows → {path}")
+    print(f"  Saved {len(df)} rows -> {path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
-    print("⬇  Downloading data...")
+    print("Downloading data...")
     df = download_seasons()
 
-    print("🧹 Cleaning...")
+    print("Cleaning...")
     df = clean(df)
 
-    print("⚙  Engineering features...")
+    print("Engineering features...")
     df = add_form(df)
     df = add_goal_avg(df)
+    df = add_h2h(df, n=10)
 
-    print("💾 Saving raw CSV...")
+    print("Saving raw CSV...")
     os.makedirs("data", exist_ok=True)
     df.to_csv(RAW_PATH, index=False)
 
-    print("🗄  Writing to SQLite...")
+    print("Writing to SQLite...")
     to_sqlite(df, DB_PATH)
 
-    print(f"\n✅ Done — {len(df)} matches across {df['Season'].nunique()} seasons")
+    # Write timestamp so the app knows when data was last refreshed
+    from datetime import datetime
+    with open(TIMESTAMP_PATH, "w") as f:
+        f.write(datetime.now().isoformat())
+
+    print(f"\nDone -- {len(df)} matches across {df['Season'].nunique()} seasons")
     print(f"   Teams: {df['HomeTeam'].nunique()}")
-    print(f"   Date range: {df['Date'].min().date()} → {df['Date'].max().date()}")
+    print(f"   Date range: {df['Date'].min()} -> {df['Date'].max()}")
 
 
 if __name__ == "__main__":
