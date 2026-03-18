@@ -7,12 +7,13 @@ Run:
     streamlit run app.py
 """
 
+import json
 import sqlite3
 import pickle
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pandas as pd
 import requests
@@ -24,6 +25,7 @@ DB_PATH        = "data/football.db"
 MODEL_PATH     = "models/rf_model.pkl"
 ENC_PATH       = "models/label_encoder.pkl"
 TIMESTAMP_PATH = "data/last_updated.txt"
+LOG_PATH       = "data/prediction_log.json"
 CURRENT_SEASON = "2025-26"
 REFRESH_DAYS   = 7
 
@@ -327,6 +329,99 @@ def prediction_gauge(home_prob, draw_prob, away_prob, home, away):
     return fig
 
 
+@st.cache_data(ttl=21600)
+def fetch_upcoming_fixtures() -> list[dict]:
+    """Fetch upcoming PL fixtures from FPL API (cached 6 h)."""
+    try:
+        r1 = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/",
+                          timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r1.raise_for_status()
+        team_map = {t["id"]: t["name"] for t in r1.json()["teams"]}
+
+        r2 = requests.get("https://fantasy.premierleague.com/api/fixtures/?future=1",
+                          timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r2.raise_for_status()
+        out = []
+        for f in r2.json():
+            if f.get("finished") or f.get("started"):
+                continue
+            home_fpl = team_map.get(f["team_h"], "")
+            away_fpl = team_map.get(f["team_a"], "")
+            ko = f.get("kickoff_time")
+            if ko:
+                dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+                ko_str = dt.astimezone(tz=None).strftime("%d %b %Y %H:%M")
+            else:
+                ko_str = "TBC"
+            out.append({
+                "gw":        f.get("event") or 0,
+                "home":      FPL_TO_DB.get(home_fpl, home_fpl),
+                "away":      FPL_TO_DB.get(away_fpl, away_fpl),
+                "kickoff":   ko_str,
+                "home_diff": f.get("team_h_difficulty", 3),
+                "away_diff": f.get("team_a_difficulty", 3),
+            })
+        return sorted(out, key=lambda x: (x["gw"], x["kickoff"]))
+    except Exception:
+        return []
+
+
+def h2h_table(df: pd.DataFrame, team1: str, team2: str, n: int = 10) -> pd.DataFrame:
+    mask = (
+        ((df["HomeTeam"] == team1) & (df["AwayTeam"] == team2)) |
+        ((df["HomeTeam"] == team2) & (df["AwayTeam"] == team1))
+    )
+    past = df[mask].sort_values("Date", ascending=False).head(n).copy()
+    if past.empty:
+        return pd.DataFrame()
+
+    def t1_result(row):
+        if row["HomeTeam"] == team1:
+            return {"H": "Win", "D": "Draw", "A": "Loss"}[row["FTR"]]
+        return {"A": "Win", "D": "Draw", "H": "Loss"}[row["FTR"]]
+
+    past["Result"] = past.apply(t1_result, axis=1)
+    past["Score"]  = past.apply(lambda r: f"{int(r['FTHG'])}-{int(r['FTAG'])}", axis=1)
+    past["Date"]   = past["Date"].dt.strftime("%Y-%m-%d")
+    return past[["Date", "HomeTeam", "Score", "AwayTeam", "Result"]].reset_index(drop=True)
+
+
+# ── Prediction log ────────────────────────────────────────────────────────────
+
+def load_prediction_log() -> list[dict]:
+    p = Path(LOG_PATH)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_prediction(entry: dict) -> None:
+    log = load_prediction_log()
+    log.insert(0, entry)
+    Path(LOG_PATH).write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def auto_fill_results(df: pd.DataFrame, log: list[dict]) -> tuple[list[dict], bool]:
+    """Look up actual results for pending log entries."""
+    changed = False
+    for entry in log:
+        if entry.get("actual"):
+            continue
+        mask = (
+            (df["HomeTeam"] == entry["home"]) &
+            (df["AwayTeam"] == entry["away"]) &
+            (df["Date"] >= pd.Timestamp(entry["ts"][:10]))
+        )
+        match = df[mask].sort_values("Date")
+        if not match.empty:
+            entry["actual"] = match.iloc[0]["FTR"]
+            changed = True
+    return log, changed
+
+
 def render_injury_list(players: list[dict]):
     """Render a compact injury table for a team."""
     if not players:
@@ -377,8 +472,9 @@ with st.sidebar:
 all_injuries = fetch_fpl_injuries()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🔮 Predict a Match", "📊 Team Form", "📈 League Trends", "🏥 Injuries & News"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🔮 Predict", "📊 Team Form", "📈 League Trends",
+    "🗓️ Fixtures", "📋 Prediction Log", "🏥 Injuries & News",
 ])
 
 # ── Tab 1 : Prediction ────────────────────────────────────────────────────────
@@ -493,6 +589,20 @@ with tab1:
                     st.markdown(f"**🏥 {away_team} absentees**")
                     render_injury_list(away_players)
 
+            # ── Save to prediction log
+            save_prediction({
+                "ts":       datetime.now().isoformat(timespec="seconds"),
+                "home":     home_team,
+                "away":     away_team,
+                "pred":     pred,
+                "prob_H":   round(float(proba_dict.get("H", 0)), 3),
+                "prob_D":   round(float(proba_dict.get("D", 0)), 3),
+                "prob_A":   round(float(proba_dict.get("A", 0)), 3),
+                "inj_home": round(h_factor, 3),
+                "inj_away": round(a_factor, 3),
+                "actual":   None,
+            })
+
             with st.expander("Show model input features"):
                 st.dataframe(X.T.rename(columns={0: "Value"}).round(3))
 
@@ -536,6 +646,41 @@ with tab2:
         hide_index=True,
     )
 
+    # ── H2H section
+    st.divider()
+    st.markdown("**Head-to-head history**")
+
+    upcoming = fetch_upcoming_fixtures()
+    next_match = next(
+        (f for f in upcoming if f["home"] == selected_team or f["away"] == selected_team), None
+    )
+
+    if next_match:
+        next_opp = next_match["away"] if next_match["home"] == selected_team else next_match["home"]
+        next_venue = "Home" if next_match["home"] == selected_team else "Away"
+        st.caption(f"Next fixture: **{next_venue}** vs **{next_opp}** — GW{next_match['gw']} · {next_match['kickoff']}")
+    else:
+        next_opp = None
+        st.caption("No upcoming fixture found — select opponent manually below")
+
+    all_opponents = sorted([t for t in teams if t != selected_team])
+    default_idx = all_opponents.index(next_opp) if next_opp and next_opp in all_opponents else 0
+    h2h_opp = st.selectbox("Compare H2H vs", all_opponents, index=default_idx, key="h2h_opp")
+
+    h2h_df = h2h_table(df, selected_team, h2h_opp)
+    if h2h_df.empty:
+        st.info(f"No H2H history found between {selected_team} and {h2h_opp}.")
+    else:
+        wins   = (h2h_df["Result"] == "Win").sum()
+        draws  = (h2h_df["Result"] == "Draw").sum()
+        losses = (h2h_df["Result"] == "Loss").sum()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Matches", len(h2h_df))
+        m2.metric(f"{selected_team} wins", wins)
+        m3.metric("Draws", draws)
+        m4.metric(f"{h2h_opp} wins", losses)
+        st.dataframe(style_results_table(h2h_df), use_container_width=True, hide_index=True)
+
 # ── Tab 3 : League trends ─────────────────────────────────────────────────────
 with tab3:
     st.subheader(f"League stats — {CURRENT_SEASON}")
@@ -565,8 +710,95 @@ with tab3:
         fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#f0f0f0")
         st.plotly_chart(fig_pie, use_container_width=True)
 
-# ── Tab 4 : Injuries & News ───────────────────────────────────────────────────
+# ── Tab 4 : Fixtures ─────────────────────────────────────────────────────────
 with tab4:
+    st.subheader("Upcoming fixtures")
+    if st.button("Refresh fixtures"):
+        fetch_upcoming_fixtures.clear()
+        st.rerun()
+
+    fixtures = fetch_upcoming_fixtures()
+    if not fixtures:
+        st.warning("Could not fetch fixtures. Check your internet connection.")
+    else:
+        # Group by gameweek
+        gws = sorted({f["gw"] for f in fixtures})
+        for gw in gws[:5]:  # show next 5 gameweeks
+            gw_fixtures = [f for f in fixtures if f["gw"] == gw]
+            st.markdown(f"**Gameweek {gw}**")
+            rows = []
+            for f in gw_fixtures:
+                diff_bar = lambda d: "🟢" if d <= 2 else ("🟡" if d == 3 else ("🟠" if d == 4 else "🔴"))
+                rows.append({
+                    "Kick-off":  f["kickoff"],
+                    "Home":      f["home"],
+                    "Away":      f["away"],
+                    "Home diff": diff_bar(f["home_diff"]),
+                    "Away diff": diff_bar(f["away_diff"]),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ── Tab 5 : Prediction Log ────────────────────────────────────────────────────
+with tab5:
+    st.subheader("Prediction log")
+
+    log = load_prediction_log()
+    # Auto-fill actual results from DB
+    log, changed = auto_fill_results(df, log)
+    if changed:
+        Path(LOG_PATH).write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if not log:
+        st.info("No predictions yet — run a prediction in the Predict tab.")
+    else:
+        if st.button("Clear all predictions"):
+            Path(LOG_PATH).write_text("[]", encoding="utf-8")
+            st.rerun()
+
+        rows = []
+        for e in log:
+            pred_label  = {"H": "Home win", "D": "Draw", "A": "Away win"}.get(e["pred"], e["pred"])
+            actual      = e.get("actual")
+            actual_label = {"H": "Home win", "D": "Draw", "A": "Away win"}.get(actual, "Pending") if actual else "Pending"
+            correct     = (e["pred"] == actual) if actual else None
+            rows.append({
+                "Date":      e["ts"][:10],
+                "Home":      e["home"],
+                "Away":      e["away"],
+                "Predicted": pred_label,
+                "H %":       f"{e['prob_H']*100:.0f}",
+                "D %":       f"{e['prob_D']*100:.0f}",
+                "A %":       f"{e['prob_A']*100:.0f}",
+                "Actual":    actual_label,
+                "Correct":   "✅" if correct is True else ("❌" if correct is False else "⏳"),
+            })
+
+        log_df = pd.DataFrame(rows)
+
+        # Summary metrics
+        completed = [e for e in log if e.get("actual")]
+        if completed:
+            accuracy = sum(e["pred"] == e["actual"] for e in completed) / len(completed)
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Total predictions", len(log))
+            mc2.metric("Completed", len(completed))
+            mc3.metric("Accuracy", f"{accuracy:.0%}")
+
+        def color_log_row(row):
+            if row["Correct"] == "✅":
+                return ["background-color: #1a4d2e; color: #f0f0f0"] * len(row)
+            elif row["Correct"] == "❌":
+                return ["background-color: #4d1a1a; color: #f0f0f0"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            log_df.style.apply(color_log_row, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# ── Tab 6 : Injuries & News ───────────────────────────────────────────────────
+with tab6:
     col_inj, col_news = st.columns([1, 1])
 
     with col_inj:

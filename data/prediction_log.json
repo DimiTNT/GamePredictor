@@ -1,0 +1,38 @@
+[
+  {
+    "ts": "2026-03-18T17:29:01",
+    "home": "Bournemouth",
+    "away": "Man United",
+    "pred": "A",
+    "prob_H": 0.305,
+    "prob_D": 0.308,
+    "prob_A": 0.387,
+    "inj_home": 0.8,
+    "inj_away": 0.8,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:28:24",
+    "home": "Aston Villa",
+    "away": "West Ham",
+    "pred": "H",
+    "prob_H": 0.37,
+    "prob_D": 0.31,
+    "prob_A": 0.319,
+    "inj_home": 0.8,
+    "inj_away": 0.88,
+    "actual": null
+  },
+  {
+    "ts": "2026-03-18T17:23:38",
+    "home": "Arsenal",
+    "away": "Aston Villa",
+    "pred": "H",
+    "prob_H": 0.462,
+    "prob_D": 0.359,
+    "prob_A": 0.179,
+    "inj_home": 1.0,
+    "inj_away": 0.988,
+    "actual": null
+  }
+]
