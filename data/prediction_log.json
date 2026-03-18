@@ -1,5 +1,17 @@
 [
   {
+    "ts": "2026-03-18T17:49:11",
+    "home": "Man City",
+    "away": "Arsenal",
+    "pred": "H",
+    "prob_H": 0.428,
+    "prob_D": 0.37,
+    "prob_A": 0.202,
+    "inj_home": 0.88,
+    "inj_away": 0.85,
+    "actual": null
+  },
+  {
     "ts": "2026-03-18T17:35:22",
     "home": "Tottenham",
     "away": "Nott'm Forest",
